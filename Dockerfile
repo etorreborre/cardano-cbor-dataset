@@ -118,6 +118,7 @@ RUN cabal update
 
 COPY cardano-cbor-dataset.cabal cbor-dataset/cardano-cbor-dataset.cabal
 COPY app/ cbor-dataset/app/
+COPY scripts/stage-hpc /usr/local/bin/stage-hpc
 
 RUN printf '%s\n' \
       'tests: False' \
@@ -125,6 +126,9 @@ RUN printf '%s\n' \
       'coverage: True' \
       'optimization: False' \
       'packages: ./cbor-dataset' \
+      'package cborg' \
+      '  coverage: True' \
+      '  optimization: False' \
       'package cardano-crypto-praos' \
       '  flags: -external-libsodium-vrf' \
       > cabal.project.local
@@ -140,34 +144,10 @@ RUN --mount=type=cache,target=/root/.cabal/store,sharing=locked \
     && test -x "$cbor" \
     && install -m 0755 "$generate_cbor" /usr/local/bin/generate-cbor \
     && install -m 0755 "$cbor" /usr/local/bin/cbor \
-    && mkdir -p \
-      /opt/hpc/mix \
-      /opt/hpc/src/opt/cardano-ledger \
-    && find dist-newstyle -type f -name '*.mix' \
-      -exec cp --parents '{}' /opt/hpc/mix/ \; \
-    && find /opt/hpc/mix -type d -path '*/hpc/*/mix' -print \
-      | sort -u > /opt/hpc/hpcdirs \
-    && if [ ! -s /opt/hpc/hpcdirs ]; then \
-         echo 'coverage build produced no Cabal HPC mix roots' >&2; \
-         exit 1; \
-       fi \
-    && for package in cardano-ledger-core cardano-ledger-conway cardano-ledger-dijkstra; do \
-         if ! find /opt/hpc/mix -type f -path "*${package}*" -name '*.mix' -print -quit | grep -q .; then \
-           echo "coverage build did not instrument ${package}" >&2; \
-           exit 1; \
-         fi; \
-       done \
-    && find . \
-      -path './.git' -prune -o \
-      -path './dist-newstyle' -prune -o \
-      -type f \( -name '*.hs' -o -name '*.lhs' -o -name '*.hsc' -o -name '*.hs-boot' \) \
-      -exec cp --parents '{}' /opt/hpc/src/opt/cardano-ledger/ \; \
-    && find dist-newstyle -type f \
-      \( -name '*.hs' -o -name '*.lhs' -o -name '*.hsc' -o -name '*.hs-boot' \) \
-      -exec cp --parents '{}' /opt/hpc/src/opt/cardano-ledger/ \; \
-    && { printf '%s\n' /opt/cardano-ledger; \
-         find . -path './dist-newstyle' -prune -o -name '*.cabal' -printf '/opt/cardano-ledger/%h\n'; \
-       } | sort -u > /opt/hpc/srcdirs
+    && sh /usr/local/bin/stage-hpc \
+      /opt/cardano-ledger \
+      /opt/hpc \
+      /usr/local/bin/cbor
 
 FROM ${HASKELL_IMAGE} AS runtime
 

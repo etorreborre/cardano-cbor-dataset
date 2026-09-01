@@ -1,0 +1,161 @@
+#!/bin/sh
+set -eu
+
+project_root=${1:?usage: stage-hpc PROJECT_ROOT HPC_ROOT CBOR}
+hpc_root=${2:?usage: stage-hpc PROJECT_ROOT HPC_ROOT CBOR}
+cbor=${3:?usage: stage-hpc PROJECT_ROOT HPC_ROOT CBOR}
+store_root=${CABAL_DIR:-/root/.cabal}/store
+mix_root=$hpc_root/mix
+source_stage=$hpc_root/src
+project_stage=$source_stage$project_root
+
+mkdir -p "$mix_root" "$project_stage"
+
+# Local packages keep their coverage artifacts in dist-newstyle. An explicitly
+# instrumented external dependency can instead be installed into Cabal's store.
+(
+  cd "$project_root"
+  find dist-newstyle -type f -name '*.mix' \
+    -exec cp --parents '{}' "$mix_root/" \;
+)
+
+if [ -d "$store_root" ]; then
+  (
+    cd /
+    find "${store_root#/}" -type f -name '*.mix' \
+      -exec cp --parents '{}' "$mix_root/" \;
+  )
+fi
+
+find "$mix_root" -type d -path '*/hpc/*/mix' -print \
+  | sort -u > "$hpc_root/hpcdirs"
+
+if [ ! -s "$hpc_root/hpcdirs" ]; then
+  echo 'coverage build produced no Cabal HPC mix roots' >&2
+  exit 1
+fi
+
+# A .mix file in a persistent cache is not proof that the linked executable
+# uses that instrumented unit. The smoke-run Tix manifest supplies that proof,
+# and hpc report validates every manifest hash against the staged .mix roots.
+check_tix=$hpc_root/coverage-check.tix
+HPCTIXFILE="$check_tix" "$cbor" --help > /dev/null
+
+if [ ! -s "$check_tix" ]; then
+  echo 'instrumented cbor executable produced no HPC Tix manifest' >&2
+  exit 1
+fi
+
+# Cabal may build an external package from a temporary unpack directory. Fetch
+# the exact linked cborg version into a stable path so its source survives in
+# the runtime image and hpc markup can render Codec.CBOR modules.
+cborg_unit=$(grep -o 'cborg-[^/]*/Codec\.CBOR\.Decoding' "$check_tix" | head -n 1)
+cborg_version=$(printf '%s\n' "$cborg_unit" \
+  | sed -n 's|^cborg-\([0-9][0-9.]*\).*/Codec\.CBOR\.Decoding$|\1|p')
+case "$cborg_version" in
+  ''|*[!0-9.]*)
+    echo 'could not determine the linked cborg version from the HPC manifest' >&2
+    exit 1
+    ;;
+esac
+mkdir -p "$project_root/coverage-deps"
+cabal get --destdir="$project_root/coverage-deps" \
+  "cborg-$cborg_version" > /dev/null
+
+hpc_dirs=$(sed 's|^|--hpcdir=|' "$hpc_root/hpcdirs")
+# Paths are build-controlled and contain no whitespace; split into hpc options.
+# hpc folds updates right-to-left, so reset must follow the explicit directories.
+# shellcheck disable=SC2086
+hpc report $hpc_dirs --reset-hpcdirs "$check_tix" > /dev/null
+
+# Preserve the paths embedded in .mix files. Besides the checked-out sources,
+# dist-newstyle contains generated modules and unpacked external package sources.
+(
+  cd "$project_root"
+  find . \
+    -path './.git' -prune -o \
+    -path './dist-newstyle' -prune -o \
+    -type f \( -name '*.hs' -o -name '*.lhs' -o -name '*.hsc' -o -name '*.hs-boot' \) \
+    -exec cp --parents '{}' "$project_stage/" \;
+  find dist-newstyle -type f \
+    \( -name '*.hs' -o -name '*.lhs' -o -name '*.hsc' -o -name '*.hs-boot' \) \
+    -exec cp --parents '{}' "$project_stage/" \;
+)
+
+{
+  printf '%s\n' "$project_root"
+  (
+    cd "$project_root"
+    find . \
+      -path './.git' -prune -o \
+      -path './dist-newstyle' -prune -o \
+      -name '*.cabal' -printf "$project_root/%h\n"
+    find dist-newstyle -type f -name '*.cabal' \
+      -printf "$project_root/%h\n"
+  )
+} | sort -u > "$hpc_root/srcdirs"
+
+require_module() {
+  module=$1
+  source_path=$(printf '%s' "$module" | tr . /)
+
+  if ! grep -Fq "/$module\"" "$check_tix"; then
+    echo "linked cbor executable did not instrument $module" >&2
+    exit 1
+  fi
+
+  if ! find "$mix_root" -type f -path "*/$module.mix" -print -quit | grep -q .; then
+    echo "coverage build did not instrument $module" >&2
+    exit 1
+  fi
+
+  if ! find "$source_stage" -type f \
+    \( -path "*/$source_path.hs" \
+       -o -path "*/$source_path.lhs" \
+       -o -path "*/$source_path.hsc" \
+       -o -path "*/$source_path.hs-boot" \) \
+    -print -quit | grep -q .; then
+    echo "coverage build did not stage source for $module" >&2
+    exit 1
+  fi
+}
+
+# This is the decoding coverage contract for both supported eras. It checks
+# concrete modules rather than package-name substrings, including cborg's
+# primitive parser boundary and the inherited ledger-era decoding stack.
+for module in \
+  Codec.CBOR.Decoding \
+  Codec.CBOR.Read \
+  Cardano.Ledger.Binary.Decoding.Coders \
+  Cardano.Ledger.Binary.Decoding.DecCBOR \
+  Cardano.Ledger.Binary.Decoding.Decoder \
+  Cardano.Ledger.BaseTypes \
+  Cardano.Ledger.TxIn \
+  Cardano.Ledger.Shelley.TxBody \
+  Cardano.Ledger.Allegra.TxBody \
+  Cardano.Ledger.Mary.Value \
+  Cardano.Ledger.Alonzo.Tx \
+  Cardano.Ledger.Babbage.TxOut \
+  Cardano.Ledger.Conway.Governance.Procedures \
+  Cardano.Ledger.Conway.TxBody \
+  Test.Cardano.Ledger.Conway.Binary.Annotator \
+  Cardano.Ledger.Dijkstra.TxBody \
+  Test.Cardano.Ledger.Dijkstra.Binary.Annotator \
+  Cardano.Protocol.TPraos.BlockHeader
+do
+  require_module "$module"
+done
+
+check_html=$hpc_root/coverage-check-html
+src_dirs=$(sed 's|^|--srcdir=|' "$hpc_root/srcdirs")
+mkdir "$check_html"
+# shellcheck disable=SC2086
+hpc markup $hpc_dirs --reset-hpcdirs $src_dirs \
+  --destdir="$check_html" "$check_tix" > /dev/null
+
+if [ ! -s "$check_html/hpc_index_alt.html" ]; then
+  echo 'coverage build did not produce the alternative coverage index' >&2
+  exit 1
+fi
+
+rm -rf "$check_html" "$check_tix"
