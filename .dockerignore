@@ -1,0 +1,7 @@
+*
+!Dockerfile
+!cardano-cbor-dataset.cabal
+!app/
+!app/**
+!scripts/
+!scripts/**

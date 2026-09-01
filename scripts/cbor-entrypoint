@@ -1,0 +1,86 @@
+#!/bin/sh
+set -eu
+
+cbor=/usr/local/bin/cbor
+
+if [ "${1-}" != "verify" ]; then
+  export HPCTIXFILE="/tmp/cbor-$$.tix"
+  exec "$cbor" "$@"
+fi
+
+coverage_root=${CBOR_COVERAGE_DIR:-/output/coverage}
+mkdir -p "$coverage_root"
+
+mode=
+dataset=
+for arg in "$@"; do
+  if [ -n "$mode" ]; then
+    dataset=$arg
+    break
+  fi
+  case "$arg" in
+    deserialize|reserialize|expected) mode=$arg ;;
+  esac
+done
+
+if [ -z "$dataset" ]; then
+  exec "$cbor" "$@"
+fi
+
+dataset_name=$(basename "$dataset")
+case "$dataset_name" in
+  ''|.|..|*[!A-Za-z0-9._-]*)
+    echo "unsupported dataset directory name for coverage: $dataset_name" >&2
+    exit 2
+    ;;
+esac
+
+timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+run_dir="$coverage_root/$dataset_name-$mode-$timestamp"
+mkdir "$run_dir"
+tix_file="$run_dir/cbor.tix"
+export HPCTIXFILE="$tix_file"
+
+verify_status=0
+"$cbor" "$@" || verify_status=$?
+
+report_status=0
+if [ ! -s "$tix_file" ]; then
+  echo "coverage data was not produced: $tix_file" >&2
+  report_status=1
+else
+  # Build-controlled paths contain no whitespace, so intentional word splitting
+  # turns each manifest line into one hpc option.
+  hpc_dirs=$(sed 's|^|--hpcdir=|' /opt/hpc/hpcdirs)
+  src_dirs=$(sed 's|^|--srcdir=|' /opt/hpc/srcdirs)
+
+  # hpc applies option updates right-to-left, so reset must follow hpcdirs.
+  # shellcheck disable=SC2086
+  hpc report --per-module $hpc_dirs --reset-hpcdirs "$tix_file" \
+    > "$run_dir/report.txt" || report_status=1
+  # shellcheck disable=SC2086
+  hpc report --per-module --xml-output $hpc_dirs --reset-hpcdirs "$tix_file" \
+    > "$run_dir/report.xml" || report_status=1
+  mkdir -p "$run_dir/html"
+  # shellcheck disable=SC2086
+  hpc markup $hpc_dirs --reset-hpcdirs $src_dirs \
+    --destdir="$run_dir/html" "$tix_file" \
+    > "$run_dir/markup.log" 2>&1 || report_status=1
+  if [ ! -s "$run_dir/html/hpc_index_alt.html" ]; then
+    echo "alternative coverage report was not produced" >&2
+    report_status=1
+  fi
+fi
+
+echo "Coverage directory: $run_dir"
+if [ "$report_status" -eq 0 ]; then
+  echo "Coverage summary:   $run_dir/report.txt"
+  echo "Alternative report: $run_dir/html/hpc_index_alt.html"
+else
+  echo "coverage report generation failed; retained artifacts in $run_dir" >&2
+fi
+
+if [ "$verify_status" -ne 0 ]; then
+  exit "$verify_status"
+fi
+exit "$report_status"
