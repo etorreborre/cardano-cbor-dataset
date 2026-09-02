@@ -96,6 +96,11 @@ container returns the verifier's exit status. Set `CBOR_COVERAGE_DIR` to put
 reports elsewhere; the selected directory must be writable and outside the
 dataset being verified. Concurrent runs receive separate directories.
 
+Every `verify` invocation also writes its error messages to `failures.log`
+inside that invocation's coverage directory. The verifier statistics and the
+failure-log path are printed to standard output; individual errors remain in
+the log instead of overwhelming the console output.
+
 ## CLI discovery
 
 ```

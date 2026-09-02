@@ -3,6 +3,16 @@ set -eu
 
 cbor=/usr/local/bin/cbor
 
+set_dataset_name() {
+  dataset_name=$(basename "$1")
+  case "$dataset_name" in
+    ''|.|..|*[!A-Za-z0-9._-]*)
+      echo "unsupported dataset directory name for artifacts: $dataset_name" >&2
+      exit 2
+      ;;
+  esac
+}
+
 if [ "${1-}" != "verify" ]; then
   export HPCTIXFILE="/tmp/cbor-$$.tix"
   exec "$cbor" "$@"
@@ -27,22 +37,17 @@ if [ -z "$dataset" ]; then
   exec "$cbor" "$@"
 fi
 
-dataset_name=$(basename "$dataset")
-case "$dataset_name" in
-  ''|.|..|*[!A-Za-z0-9._-]*)
-    echo "unsupported dataset directory name for coverage: $dataset_name" >&2
-    exit 2
-    ;;
-esac
+set_dataset_name "$dataset"
 
 timestamp=$(date -u +%Y%m%dT%H%M%SZ)
 run_dir="$coverage_root/$dataset_name-$mode-$timestamp"
 mkdir "$run_dir"
+failure_log="$run_dir/failures.log"
 tix_file="$run_dir/cbor.tix"
 export HPCTIXFILE="$tix_file"
 
 verify_status=0
-"$cbor" "$@" || verify_status=$?
+"$cbor" "$@" 2> "$failure_log" || verify_status=$?
 
 report_status=0
 if [ ! -s "$tix_file" ]; then
@@ -73,6 +78,7 @@ else
 fi
 
 echo "Coverage directory: $run_dir"
+echo "Failure log:       $failure_log"
 if [ "$report_status" -eq 0 ]; then
   echo "Coverage summary:   $run_dir/report.txt"
   echo "Alternative report: $run_dir/html/hpc_index_alt.html"
