@@ -14,7 +14,7 @@ import Control.Monad (foldM, forM, unless, when)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
 import Data.Char (digitToInt, isHexDigit, isSpace)
-import Data.List (isInfixOf, sort)
+import Data.List (isInfixOf, isPrefixOf, sort)
 import qualified Data.Set as Set
 import LedgerRules (
   EraSpec,
@@ -30,6 +30,7 @@ import Numeric (readHex)
 import System.Directory (
   canonicalizePath,
   createDirectoryIfMissing,
+  doesDirectoryExist,
   getPermissions,
   listDirectory,
   removePathForcibly,
@@ -37,7 +38,7 @@ import System.Directory (
   writable,
  )
 import System.Exit (ExitCode (ExitFailure, ExitSuccess), die, exitFailure)
-import System.FilePath ((</>), makeRelative, splitDirectories, takeDirectory, takeExtension, takeFileName)
+import System.FilePath ((</>), splitDirectories, takeDirectory, takeExtension, takeFileName)
 import System.IO (hPutStrLn, stderr)
 import System.IO.Error (isDoesNotExistError)
 import System.IO.Temp (createTempDirectory)
@@ -176,9 +177,7 @@ listDatasetFiles era root = do
 
 pathIsWithin :: FilePath -> FilePath -> Bool
 pathIsWithin parent child =
-  case splitDirectories $ makeRelative parent child of
-    ".." : _ -> False
-    _ -> True
+  splitDirectories parent `isPrefixOf` splitDirectories child
 
 pathsOverlap :: FilePath -> FilePath -> Bool
 pathsOverlap left right = pathIsWithin left right || pathIsWithin right left
@@ -203,8 +202,9 @@ resolveVerificationMode _ mode = pure mode
 resolveNewExpectedDirectory :: FilePath -> FilePath -> IO FilePath
 resolveNewExpectedDirectory datasetRoot requested = do
   requireAbsentPath requested
-  requireRealDirectory "parent directory for expected output" $ takeDirectory requested
-  canonicalDisjointDirectory datasetRoot requested
+  directory <- canonicalDisjointDirectory datasetRoot requested
+  createDirectoryIfMissing True $ takeDirectory directory
+  pure directory
 
 cleanupDirectory :: FilePath -> IO ()
 cleanupDirectory path = do
@@ -319,18 +319,36 @@ emitExpectedDataset :: EraSpec -> FilePath -> FilePath -> IO ()
 emitExpectedDataset era datasetDir requestedOutputDir = do
   (root, files) <- loadDataset era datasetDir
   outputRoot <- resolveNewExpectedDirectory root requestedOutputDir
-  publishDirectory outputRoot $ \staging -> do
-    outcomes <- forM files $ \datasetFile ->
-      emitExpectedFile staging datasetFile >>= reportResult datasetFile
-
-    let total = length outcomes
-        emitted = length [() | Right True <- outcomes]
-        failed = length [() | Left _ <- outcomes]
-    putStrLn $ "Checked " <> show total <> " " <> eraSpecName era <> " CBOR files"
-    putStrLn $ "  expected outputs emitted: " <> show emitted
-    putStrLn $ "  failed:                   " <> show failed
-    if failed == 0 then pure () else exitFailure
-  putStrLn $ "  output directory:         " <> outputRoot
+  publication <-
+    try
+      ( publishDirectory outputRoot $ \staging -> do
+          outcomes <- forM files $ \datasetFile ->
+            emitExpectedFile staging datasetFile >>= reportResult datasetFile
+          pure
+            ( length outcomes
+            , length [() | Right True <- outcomes]
+            , length [() | Left _ <- outcomes]
+            )
+      )
+      :: IO (Either IOException (Int, Int, Int))
+  (total, emitted, failed) <-
+    case publication of
+      Left err -> do
+        putStrLn $ "  output directory created: no (" <> outputRoot <> ")"
+        die $ "cannot publish expected outputs: " <> show err
+      Right summary -> pure summary
+  created <- doesDirectoryExist outputRoot
+  putStrLn $ "Checked " <> show total <> " " <> eraSpecName era <> " CBOR files"
+  putStrLn $ "  expected outputs emitted: " <> show emitted
+  putStrLn $ "  failed:                   " <> show failed
+  putStrLn $
+    "  output directory created: "
+      <> (if created then "yes" else "no")
+      <> " ("
+      <> outputRoot
+      <> ")"
+  unless created $ die "expected output publication completed but its directory is missing"
+  when (failed /= 0) exitFailure
 
 sha256Hex :: BS.ByteString -> String
 sha256Hex bytes =

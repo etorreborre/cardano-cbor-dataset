@@ -54,10 +54,12 @@ Then compare each valid input's reserialization with that reference tree:
 docker run --rm --platform=linux/amd64 -v "$PWD/dataset:/output" cbor verify --era dijkstra expected /output/dijkstra-123-100 /output/dijkstra-123-100.expected
 ```
 
-The parent of an `emit-expected` destination must exist and the destination
-itself must be absent. Dataset and expected-output directories must not
-overlap. Reference generation also uses a sibling staging tree and publishes
-only a complete, successful result.
+`emit-expected` creates missing parent directories for its destination. The
+destination itself must be absent. Dataset and expected-output directories
+must not overlap. Reference generation uses a sibling staging tree and
+publishes all successfully produced outputs together after processing. If any
+input fails, the partial reference tree is preserved and the command exits with
+failure.
 
 The verification modes are:
 
