@@ -21,21 +21,22 @@ fi
 coverage_root=${CBOR_COVERAGE_DIR:-/output/coverage}
 mkdir -p "$coverage_root"
 
+# The era option may sit on either side of the mode, so name the run from the
+# mode word and the trailing dataset argument rather than from arg positions.
 mode=
 dataset=
 for arg in "$@"; do
-  if [ -n "$mode" ]; then
-    dataset=$arg
-    break
-  fi
   case "$arg" in
-    deserialize|reserialize|expected) mode=$arg ;;
+    deserialize|expected) mode=$arg ;;
   esac
+  dataset=$arg
 done
 
-if [ -z "$dataset" ]; then
-  exec "$cbor" "$@"
-fi
+case "$mode:$dataset" in
+  :*|*:-*|deserialize:deserialize|expected:expected)
+    exec "$cbor" "$@"
+    ;;
+esac
 
 set_dataset_name "$dataset"
 
