@@ -149,6 +149,36 @@ RUN --mount=type=cache,target=/root/.cabal/store,sharing=locked \
       /opt/hpc \
       /usr/local/bin/cbor
 
+# The normalization vectors pin the specification, so checking them is its own
+# stage: a stale vector fails here without blocking a build of the tool, and the
+# runtime image never depends on this stage.
+FROM builder AS vector-check
+
+ARG CABAL_JOBS=8
+
+COPY test/ cbor-dataset/test/
+COPY normalization-vectors/ cbor-dataset/normalization-vectors/
+
+RUN printf '%s\n' \
+      'tests: True' \
+      'benchmarks: False' \
+      'optimization: False' \
+      'packages: ./cbor-dataset' \
+      'package cardano-crypto-praos' \
+      '  flags: -external-libsodium-vrf' \
+      > cabal.project.local
+
+# The binary is run directly rather than through `cabal test`, so the vector
+# directory can be named as an argument and a failure prints the offending case
+# instead of a captured log path.
+RUN --mount=type=cache,target=/root/.cabal/store,sharing=locked \
+    --mount=type=cache,target=/opt/cardano-ledger/dist-newstyle,sharing=locked \
+    cabal build --jobs="${CABAL_JOBS}" \
+      cardano-cbor-dataset:test:normalization-vectors \
+    && check="$(cabal list-bin cardano-cbor-dataset:test:normalization-vectors | tail -n 1)" \
+    && test -x "$check" \
+    && "$check" cbor-dataset/normalization-vectors
+
 FROM ${HASKELL_IMAGE} AS runtime
 
 ARG LEDGER_COMMIT
