@@ -1,49 +1,47 @@
 module Main where
 
-import Corpus (
-  VerificationMode (..),
-  emitExpectedDataset,
-  generateDataset,
-  verifyDataset,
- )
+import Corpus
+  ( VerificationMode (..),
+    generateDataset,
+    verifyDataset,
+  )
 import Data.List (intercalate)
-import LedgerRules (
-  EraSpec,
-  eraSpecName,
-  lookupEra,
-  ruleNames,
-  supportedEraNames,
-  supportedEras,
- )
-import Options.Applicative (
-  Parser,
-  ParserInfo,
-  ReadM,
-  argument,
-  command,
-  customExecParser,
-  eitherReader,
-  fullDesc,
-  header,
-  help,
-  helper,
-  hsubparser,
-  info,
-  long,
-  metavar,
-  option,
-  prefs,
-  progDesc,
-  showHelpOnEmpty,
-  showHelpOnError,
-  strArgument,
-  (<**>),
- )
+import LedgerRules
+  ( EraSpec,
+    eraSpecName,
+    lookupEra,
+    ruleNames,
+    supportedEraNames,
+    supportedEras,
+  )
+import Options.Applicative
+  ( Parser,
+    ParserInfo,
+    ReadM,
+    argument,
+    command,
+    customExecParser,
+    eitherReader,
+    fullDesc,
+    header,
+    help,
+    helper,
+    hsubparser,
+    info,
+    long,
+    metavar,
+    option,
+    prefs,
+    progDesc,
+    showHelpOnEmpty,
+    showHelpOnError,
+    strArgument,
+    (<**>),
+  )
 
 data Command
   = Generate EraSpec FilePath Integer Int
   | Verify EraSpec VerificationMode FilePath
-  | EmitExpected EraSpec FilePath FilePath
   | ListEras
   | ListRules EraSpec
 
@@ -78,22 +76,21 @@ datasetArgument = strArgument $ metavar "DATASET_DIR"
 commandInfo :: String -> Parser a -> ParserInfo a
 commandInfo description parser = info parser $ progDesc description
 
-verifyRequestParser :: Parser (VerificationMode, FilePath)
-verifyRequestParser =
+-- | The era belongs to each mode rather than to @verify@ itself, so that
+-- @verify MODE --era ERA DATASET_DIR@ reads in the order it is documented.
+verifyModeParser :: VerificationMode -> Parser Command
+verifyModeParser mode = (\era dataset -> Verify era mode dataset) <$> eraOption <*> datasetArgument
+
+verifyParser :: Parser Command
+verifyParser =
   hsubparser $
     command
       "deserialize"
-      (commandInfo "Check decoder acceptance only" $ (,) DeserializeOnly <$> datasetArgument)
-      <> command
-        "reserialize"
-        (commandInfo "Require reserialization to equal each input" $ (,) CheckReserialization <$> datasetArgument)
+      (commandInfo "Check decoder acceptance only" $ verifyModeParser DeserializeOnly)
       <> command
         "expected"
-        ( commandInfo "Require reserialization to equal a reference tree" $
-            ( (\dataset expected -> (CheckExpectedOutput expected, dataset))
-                <$> datasetArgument
-                <*> strArgument (metavar "EXPECTED_DIR")
-            )
+        ( commandInfo "Require normalized reserialization to equal each expected file" $
+            verifyModeParser CheckExpectedOutput
         )
 
 commandParser :: Parser Command
@@ -111,14 +108,7 @@ commandParser =
       )
       <> command
         "verify"
-        ( commandInfo "Verify a CBOR corpus" $
-            ((\era (mode, dataset) -> Verify era mode dataset) <$> eraOption <*> verifyRequestParser)
-        )
-      <> command
-        "emit-expected"
-        ( commandInfo "Create a reference reserialization tree" $
-            (EmitExpected <$> eraOption <*> datasetArgument <*> strArgument (metavar "OUTPUT_DIR"))
-        )
+        (commandInfo "Verify a CBOR corpus" verifyParser)
       <> command
         "list-eras"
         (commandInfo "List supported ledger eras" $ pure ListEras)
@@ -135,7 +125,6 @@ parserInfo =
 runCommand :: Command -> IO ()
 runCommand (Generate era outputDir seed count) = generateDataset era outputDir seed count
 runCommand (Verify era mode datasetDir) = verifyDataset era mode datasetDir
-runCommand (EmitExpected era datasetDir outputDir) = emitExpectedDataset era datasetDir outputDir
 runCommand ListEras = mapM_ (putStrLn . eraSpecName) supportedEras
 runCommand (ListRules era) = mapM_ putStrLn $ ruleNames era
 

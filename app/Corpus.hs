@@ -1,148 +1,178 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 
-module Corpus (
-  VerificationMode (..),
-  generateDataset,
-  verifyDataset,
-  emitExpectedDataset,
-) where
+module Corpus
+  ( VerificationMode (..),
+    generateDataset,
+    verifyDataset,
+  )
+where
 
 import Cardano.Crypto.Hash.Class (Hash, hashToStringAsHex, hashWith)
 import Cardano.Crypto.Hash.SHA256 (SHA256)
-import Control.Exception (IOException, onException, try)
-import Control.Monad (foldM, forM, unless, when)
+import Control.Exception (IOException, try)
+import Control.Monad (foldM, forM, forM_, unless, when)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
 import Data.Char (digitToInt, isHexDigit, isSpace)
-import Data.List (isInfixOf, isPrefixOf, sort)
+import Data.Either (isLeft)
+import Data.List (intercalate, isInfixOf, sort)
+import Data.Maybe (isNothing)
+import Data.Monoid (Sum (..))
+import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
-import LedgerRules (
-  EraSpec,
-  RuleCheck,
-  deserializeRule,
-  eraSpecName,
-  eraSpecRules,
-  lookupRule,
-  reserializeRule,
-  ruleCheckName,
- )
+import LedgerRules
+  ( EraSpec,
+    RuleCheck,
+    deserializeRule,
+    eraSpecName,
+    eraSpecProtocolVersion,
+    eraSpecRules,
+    lookupRule,
+    reserializeRule,
+    ruleCheckByteExact,
+    ruleCheckName,
+  )
+import Normalize (normalizeBytes)
 import Numeric (readHex)
-import System.Directory (
-  canonicalizePath,
-  createDirectoryIfMissing,
-  doesDirectoryExist,
-  getPermissions,
-  listDirectory,
-  removePathForcibly,
-  renameDirectory,
-  writable,
- )
+import Paths
+  ( listDirectoryChecked,
+    publishDirectory,
+    requireCBORFile,
+    requireRealDirectory,
+  )
+import Report
+  ( ConformanceReport (..),
+    Failure (..),
+    Outcome (..),
+    Reason,
+    FailureKind (..),
+    failureKindLabel,
+    writeReport,
+  )
+import System.Directory
+  ( canonicalizePath,
+    createDirectoryIfMissing,
+    getPermissions,
+    writable,
+  )
 import System.Exit (ExitCode (ExitFailure, ExitSuccess), die, exitFailure)
-import System.FilePath ((</>), splitDirectories, takeDirectory, takeExtension, takeFileName)
+import System.FilePath (dropExtension, takeDirectory, takeFileName, (</>))
 import System.IO (hPutStrLn, stderr)
-import System.IO.Error (isDoesNotExistError)
-import System.IO.Temp (createTempDirectory)
-import System.Posix.Files (
-  FileStatus,
-  getSymbolicLinkStatus,
-  isDirectory,
-  isRegularFile,
-  isSymbolicLink,
-  setFileMode,
- )
 import System.Process (readProcessWithExitCode)
 import Text.Printf (printf)
 
+-- VERIFICATION MODES
 data VerificationMode
   = DeserializeOnly
-  | CheckReserialization
-  | CheckExpectedOutput FilePath
+  | CheckExpectedOutput
 
 verificationModeName :: VerificationMode -> String
 verificationModeName DeserializeOnly = "deserialize"
-verificationModeName CheckReserialization = "reserialize"
-verificationModeName (CheckExpectedOutput _) = "expected"
+verificationModeName CheckExpectedOutput = "expected"
+
+modeReadsReferences :: VerificationMode -> Bool
+modeReadsReferences DeserializeOnly = False
+modeReadsReferences CheckExpectedOutput = True
 
 data Expectation = MustDecode | MustReject
   deriving (Eq)
 
 data DatasetFile = DatasetFile
-  { datasetFilePath :: !FilePath
-  , datasetFileRelativePath :: !FilePath
-  , datasetFileRule :: !RuleCheck
-  , datasetFileExpectation :: !Expectation
+  { datasetFilePath :: !FilePath,
+    datasetFileRule :: !RuleCheck,
+    datasetFileCategory :: !DatasetCategory,
+    -- | @\<rule\>\/\<category\>\/\<file stem\>@, the name a report gives this
+    -- sample. It carries no extension, so a consumer can append its own.
+    datasetFileSample :: !FilePath,
+    -- | The reference this sample's re-encoding must reproduce. Only a @valid@
+    -- sample has one, and every @valid@ sample does: generation puts a sample
+    -- it cannot decode under @invalid@ instead.
+    datasetFileExpectedPath :: !(Maybe FilePath)
   }
 
+-- | Where a sample lives, which is also what it must do. Generation decides
+-- this per sample rather than by where the generator was aimed: bytes that
+-- satisfy the CDDL but that the decoder rejects are not valid, so they go under
+-- @invalid@ at severity zero, beside the mutations of the same sample.
 data DatasetCategory = Valid | Zap !Int
+  deriving (Eq)
 
+-- | Path of a category relative to its rule directory.
 categoryName :: DatasetCategory -> FilePath
-categoryName Valid = "valid"
-categoryName (Zap level) = "zap-" <> show level
+categoryName Valid = validCategoryName
+categoryName (Zap level) = invalidCategoryName </> zapLevelName level
+
+-- | The one category that must decode.
+validCategoryName :: FilePath
+validCategoryName = "valid"
+
+-- | Parent of every category that must be rejected.
+invalidCategoryName :: FilePath
+invalidCategoryName = "invalid"
+
+zapLevelName :: Int -> FilePath
+zapLevelName level = "zap-" <> show level
 
 categoryExpectation :: DatasetCategory -> Expectation
 categoryExpectation Valid = MustDecode
 categoryExpectation (Zap _) = MustReject
 
+-- | What a sample must do. Its category settles this on its own, which is the
+-- point of putting the generator output the decoder rejects under @invalid@
+-- rather than leaving it in @valid@ without a reference.
+datasetFileExpectation :: DatasetFile -> Expectation
+datasetFileExpectation = categoryExpectation . datasetFileCategory
+
+-- | Severity zero is the unmutated sample the decoder rejects; one to three are
+-- the mutations of increasing severity.
+zapLevels :: [Int]
+zapLevels = [0 .. 3]
+
+-- | Every category a corpus can hold.
 datasetCategories :: [DatasetCategory]
-datasetCategories = Valid : map Zap [1 .. 3]
+datasetCategories = Valid : map Zap zapLevels
 
-pathStatus :: FilePath -> IO (Maybe FileStatus)
-pathStatus path = do
-  result <- try $ getSymbolicLinkStatus path
-  case result of
-    Left (err :: IOException)
-      | isDoesNotExistError err -> pure Nothing
-      | otherwise -> die $ "cannot inspect path '" <> path <> "': " <> show err
-    Right status -> pure $ Just status
+-- | The categories generation is aimed at. Severity zero is not among them: it
+-- is filled by the @valid@ run, from the samples the decoder rejects.
+generatedCategories :: [DatasetCategory]
+generatedCategories = Valid : map Zap (filter (> 0) zapLevels)
 
-requireRealDirectory :: String -> FilePath -> IO ()
-requireRealDirectory description path = do
-  status <- pathStatus path
-  case status of
-    Nothing -> die $ "missing " <> description <> ": " <> path
-    Just entry
-      | isSymbolicLink entry -> die $ description <> " must not be a symbolic link: " <> path
-      | isDirectory entry -> pure ()
-      | otherwise -> die $ "expected " <> description <> ": " <> path
+-- | Sibling of the sample categories, holding the normalized reference
+-- encoding of every @valid@ sample under the same file name.
+expectedCategoryName :: FilePath
+expectedCategoryName = "expected"
 
-requireAbsentPath :: FilePath -> IO ()
-requireAbsentPath path = do
-  status <- pathStatus path
-  case status of
-    Nothing -> pure ()
-    Just _ -> die $ "output path already exists: " <> path
-
-listDirectoryChecked :: FilePath -> IO [FilePath]
-listDirectoryChecked directory = do
-  entriesResult <- try (listDirectory directory) :: IO (Either IOException [FilePath])
-  case entriesResult of
-    Left err -> die $ "cannot list directory '" <> directory <> "': " <> show err
-    Right entries -> pure $ sort entries
-
-requireCBORFile :: FilePath -> IO ()
-requireCBORFile path = do
-  status <- pathStatus path
-  case status of
-    Just entry
-      | isSymbolicLink entry -> die $ "dataset files must not be symbolic links: " <> path
-      | isRegularFile entry && takeExtension path == ".cbor" -> pure ()
-    _ -> die $ "expected a .cbor dataset file: " <> path
-
-requireExactCategories :: FilePath -> [FilePath] -> IO ()
-requireExactCategories path actual = do
-  let sortedExpected = sort $ map categoryName datasetCategories
-      sortedActual = sort actual
-  unless (sortedExpected == sortedActual) $
+-- | Reject entries that name no category at all, and demand the two a run
+-- cannot do without: @valid@, and @expected@ in the mode that reads it.
+--
+-- An @invalid@ directory is not demanded, nor are the severities inside it. The
+-- generator creates them all but leaves one empty for a rule whose mutations
+-- the decoder never rejects, and version control tracks no empty directory, so
+-- a committed corpus arrives without them. Treating that as a broken corpus
+-- stopped verification of every other rule; the absent directories are reported
+-- in the summary instead.
+requireKnownCategories :: Bool -> FilePath -> [FilePath] -> [FilePath] -> IO ()
+requireKnownCategories referencesRequired path actual severities = do
+  let known = [validCategoryName, expectedCategoryName, invalidCategoryName]
+      unknown = sort $ filter (`notElem` known) actual
+      unknownSeverities = sort $ filter (`notElem` map zapLevelName zapLevels) severities
+      required =
+        [validCategoryName | validCategoryName `notElem` actual]
+          <> [expectedCategoryName | referencesRequired, expectedCategoryName `notElem` actual]
+  unless (null unknown) $
+    die $ "unexpected entries in '" <> path <> "': " <> show unknown
+  unless (null unknownSeverities) $
     die $
-      "invalid category entries in '"
-        <> path
-        <> "': expected "
-        <> show sortedExpected
-        <> ", got "
-        <> show sortedActual
+      "unexpected entries in '"
+        <> (path </> invalidCategoryName)
+        <> "': "
+        <> show unknownSeverities
+  unless (null required) $
+    die $ "missing directories in '" <> path <> "': " <> show required
 
-listDatasetFiles :: EraSpec -> FilePath -> IO [DatasetFile]
-listDatasetFiles era root = do
+-- | Every sample in the corpus, and the categories that are not there.
+listDatasetFiles :: EraSpec -> Bool -> FilePath -> IO ([DatasetFile], [FilePath])
+listDatasetFiles era referencesRequired root = do
   actualRules <- listDirectoryChecked root
   when (null actualRules) $ die $ "dataset contains no rule directories: " <> root
   selectedRules <- forM actualRules $ \ruleName ->
@@ -154,85 +184,73 @@ listDatasetFiles era root = do
         rulePath = root </> ruleName
     requireRealDirectory "dataset directory" rulePath
     actualCategories <- listDirectoryChecked rulePath
-    requireExactCategories rulePath actualCategories
-    categoryFiles <- forM datasetCategories $ \category -> do
-      let categoryPath = rulePath </> categoryName category
-      requireRealDirectory "dataset directory" categoryPath
-      fileNames <- listDirectoryChecked categoryPath
-      forM fileNames $ \fileName -> do
-        let relativePath = ruleName </> categoryName category </> fileName
-            path = root </> relativePath
-        requireCBORFile path
-        pure $
-          DatasetFile
-            { datasetFilePath = path
-            , datasetFileRelativePath = relativePath
-            , datasetFileRule = rule
-            , datasetFileExpectation = categoryExpectation category
-            }
-    pure $ concat categoryFiles
-  let files = concat nested
+    severities <-
+      if invalidCategoryName `elem` actualCategories
+        then do
+          requireRealDirectory "dataset directory" $ rulePath </> invalidCategoryName
+          listDirectoryChecked $ rulePath </> invalidCategoryName
+        else pure []
+    requireKnownCategories referencesRequired rulePath actualCategories severities
+    let present Valid = validCategoryName `elem` actualCategories
+        present (Zap level) = zapLevelName level `elem` severities
+    categoryFiles <- forM datasetCategories $ \category ->
+      if not $ present category
+        then pure ([], [ruleName </> categoryName category])
+        else do
+          let categoryPath = rulePath </> categoryName category
+          requireRealDirectory "dataset directory" categoryPath
+          fileNames <- listDirectoryChecked categoryPath
+          found <- forM fileNames $ \fileName -> do
+            let path = categoryPath </> fileName
+            requireCBORFile path
+            pure $
+              DatasetFile
+                { datasetFilePath = path,
+                  datasetFileRule = rule,
+                  datasetFileCategory = category,
+                  datasetFileSample =
+                    ruleName </> categoryName category </> dropExtension fileName,
+                  datasetFileExpectedPath =
+                    case category of
+                      Valid -> Just $ rulePath </> expectedCategoryName </> fileName
+                      Zap _ -> Nothing
+                }
+          pure (found, [])
+    pure (concatMap fst categoryFiles, concatMap snd categoryFiles)
+  let files = concatMap fst nested
   when (null files) $ die $ "dataset contains no CBOR files: " <> root
-  pure files
+  pure (files, concatMap snd nested)
 
-pathIsWithin :: FilePath -> FilePath -> Bool
-pathIsWithin parent child =
-  splitDirectories parent `isPrefixOf` splitDirectories child
+-- | One accepted sample decoded and re-encoded: the raw re-encoding, and the
+-- reference encoding a conforming implementation has to reproduce.
+--
+-- Normalizing is what makes an ordinary reference portable. An implementation
+-- reproduces it from its own decoder without having to reproduce this encoder's
+-- choice of container form or integer head, neither of which the format fixes.
+--
+-- A rule whose bytes are hashed is the exception, and its reference is the raw
+-- re-encoding. There the container form is fixed, by the hash, so normalizing
+-- would throw away the very thing the reference is there to pin down.
+expectedBytes :: RuleCheck -> BS.ByteString -> Either String (BS.ByteString, BS.ByteString)
+expectedBytes rule bytes = do
+  reserialized <- reserializeRule rule bytes
+  reference <-
+    if ruleCheckByteExact rule
+      then pure reserialized
+      else normalizeBytes reserialized
+  pure (reserialized, reference)
 
-pathsOverlap :: FilePath -> FilePath -> Bool
-pathsOverlap left right = pathIsWithin left right || pathIsWithin right left
-
-canonicalDisjointDirectory :: FilePath -> FilePath -> IO FilePath
-canonicalDisjointDirectory datasetRoot requested = do
-  directory <- canonicalizePath requested
-  when (pathsOverlap datasetRoot directory) $
-    die "expected output and dataset directories must not overlap"
-  pure directory
-
-resolveExpectedDirectory :: FilePath -> FilePath -> IO FilePath
-resolveExpectedDirectory datasetRoot requested = do
-  requireRealDirectory "expected output directory" requested
-  canonicalDisjointDirectory datasetRoot requested
-
-resolveVerificationMode :: FilePath -> VerificationMode -> IO VerificationMode
-resolveVerificationMode datasetRoot (CheckExpectedOutput requested) =
-  CheckExpectedOutput <$> resolveExpectedDirectory datasetRoot requested
-resolveVerificationMode _ mode = pure mode
-
-resolveNewExpectedDirectory :: FilePath -> FilePath -> IO FilePath
-resolveNewExpectedDirectory datasetRoot requested = do
-  requireAbsentPath requested
-  directory <- canonicalDisjointDirectory datasetRoot requested
-  createDirectoryIfMissing True $ takeDirectory directory
-  pure directory
-
-cleanupDirectory :: FilePath -> IO ()
-cleanupDirectory path = do
-  _ <- try (removePathForcibly path) :: IO (Either IOException ())
-  pure ()
-
-publishDirectory :: FilePath -> (FilePath -> IO a) -> IO a
-publishDirectory destination build = do
-  requireAbsentPath destination
-  let parent = takeDirectory destination
-      prefix = "." <> takeFileName destination <> ".tmp-"
-  staging <- createTempDirectory parent prefix
-  let cleanup = cleanupDirectory staging
-  result <- (setFileMode staging 0o755 >> build staging) `onException` cleanup
-  renameDirectory staging destination `onException` cleanup
-  pure result
-
-checkExpectation :: Expectation -> Either String a -> Either String (Maybe a)
+checkExpectation :: Expectation -> Either String a -> Either Reason (Maybe a)
 checkExpectation MustReject (Left _) = Right Nothing
-checkExpectation MustReject (Right _) = Left "deserialization unexpectedly succeeded"
-checkExpectation MustDecode (Left err) = Left $ "deserialization failed: " <> err
+checkExpectation MustReject (Right _) = Left (DecodeSucceeded, "deserialization unexpectedly succeeded")
+checkExpectation MustDecode (Left err) = Left (DecodeFailed, "deserialization failed: " <> err)
 checkExpectation MustDecode (Right value) = Right $ Just value
 
-checkDatasetFile :: (RuleCheck -> BS.ByteString -> Either String a) -> DatasetFile -> IO (Either String (BS.ByteString, Maybe a))
+checkDatasetFile :: (RuleCheck -> BS.ByteString -> Either String a) -> DatasetFile -> IO (Either Reason (BS.ByteString, Maybe a))
 checkDatasetFile operation datasetFile = do
   readResult <- try (BS.readFile $ datasetFilePath datasetFile) :: IO (Either IOException BS.ByteString)
   pure $ case readResult of
-    Left err -> Left $ "cannot read file: " <> show err
+    Left err -> Left (SampleUnreadable, "cannot read file: " <> show err)
     Right bytes -> do
       checked <-
         checkExpectation
@@ -240,53 +258,131 @@ checkDatasetFile operation datasetFile = do
           (operation (datasetFileRule datasetFile) bytes)
       pure (bytes, checked)
 
-verifyFile :: VerificationMode -> DatasetFile -> IO (Either String ())
+verifyFile :: VerificationMode -> DatasetFile -> IO (Either Reason ())
 verifyFile DeserializeOnly datasetFile =
   fmap (fmap $ const ()) $ checkDatasetFile deserializeRule datasetFile
-verifyFile CheckReserialization datasetFile = do
-  checked <- checkDatasetFile reserializeRule datasetFile
+-- | For a sample that must be rejected the only question is whether the decoder
+-- rejects it, so ask the decoder directly rather than routing through the
+-- re-encode and normalize steps, whose own failures would read as a rejection.
+verifyFile CheckExpectedOutput datasetFile
+  | isNothing (datasetFileExpectedPath datasetFile) =
+      fmap (fmap $ const ()) $ checkDatasetFile deserializeRule datasetFile
+verifyFile CheckExpectedOutput datasetFile = do
+  checked <- checkDatasetFile expectedBytes datasetFile
   case checked of
-    Left message -> pure $ Left message
+    Left reason -> pure $ Left reason
     Right (_, Nothing) -> pure $ Right ()
-    Right (original, Just bytes)
-      | bytes == original -> pure $ Right ()
-      | otherwise -> pure $ Left "reserialization differs from input"
-verifyFile (CheckExpectedOutput expectedRoot) datasetFile = do
-  checked <- checkDatasetFile reserializeRule datasetFile
-  case checked of
-    Left message -> pure $ Left message
-    Right (_, Nothing) -> pure $ Right ()
-    Right (_, Just bytes) -> do
-      let expectedPath = expectedRoot </> datasetFileRelativePath datasetFile
-      expectedResult <- try (BS.readFile expectedPath) :: IO (Either IOException BS.ByteString)
-      pure $ case expectedResult of
-        Left err -> Left $ "cannot read expected output '" <> expectedPath <> "': " <> show err
-        Right expectedBytes
-          | bytes == expectedBytes -> Right ()
-          | otherwise -> Left $ "reserialization differs from expected output '" <> expectedPath <> "'"
+    Right (original, Just (reserialized, bytes)) ->
+      case datasetFileExpectedPath datasetFile of
+        Nothing ->
+          pure $ Left (ReferenceUnreadable, "sample was accepted but has no reference encoding")
+        Just expectedPath -> do
+          expectedResult <- try (BS.readFile expectedPath) :: IO (Either IOException BS.ByteString)
+          pure $ case expectedResult of
+            Left err ->
+              Left
+                ( ReferenceUnreadable
+                , "cannot read expected output '" <> expectedPath <> "': " <> show err
+                )
+            Right referenceBytes -> do
+              -- The hashed types are checked first: agreeing with the reference
+              -- after normalization says nothing about a hash, so reporting the
+              -- weaker mismatch for one of these rules would understate it.
+              byteExactCheck original reserialized
+              if bytes == referenceBytes
+                then Right ()
+                else
+                  Left
+                    ( ReferenceMismatch
+                    , "normalized reserialization differs from '" <> expectedPath <> "'"
+                    )
+  where
+    byteExactCheck original reserialized
+      | not . ruleCheckByteExact $ datasetFileRule datasetFile = Right ()
+      | reserialized == original = Right ()
+      | otherwise =
+          Left
+            ( ByteExactMismatch
+            , "reserialization differs from the original bytes, which this rule hashes"
+            )
 
-loadDataset :: EraSpec -> FilePath -> IO (FilePath, [DatasetFile])
-loadDataset era datasetDir = do
+loadDataset :: EraSpec -> Bool -> FilePath -> IO (FilePath, [DatasetFile], [FilePath])
+loadDataset era referencesRequired datasetDir = do
   requireRealDirectory "dataset directory" datasetDir
   root <- canonicalizePath datasetDir
-  files <- listDatasetFiles era root
-  pure (root, files)
+  (files, absent) <- listDatasetFiles era referencesRequired root
+  pure (root, files, absent)
 
-reportResult :: DatasetFile -> Either String a -> IO (Either String a)
+reportResult :: DatasetFile -> Either Reason a -> IO (Either Reason a)
 reportResult datasetFile result = do
   case result of
-    Left message -> hPutStrLn stderr $ "FAIL " <> datasetFilePath datasetFile <> " (" <> message <> ")"
+    Left (_, message) ->
+      hPutStrLn stderr $ "FAIL " <> datasetFilePath datasetFile <> " (" <> message <> ")"
     Right _ -> pure ()
   pure result
 
-verifyDataset :: EraSpec -> VerificationMode -> FilePath -> IO ()
-verifyDataset era requestedMode datasetDir = do
-  (root, files) <- loadDataset era datasetDir
-  mode <- resolveVerificationMode root requestedMode
-  outcomes <- forM files $ \datasetFile ->
-    verifyFile mode datasetFile >>= reportResult datasetFile
+-- | One rule's counts. @generated@ covers everything the CDDL generator
+-- produced, which the layout splits in two: a @valid@ sample must decode,
+-- re-encode and match its reference, and an @invalid\/zap-0@ sample is the same
+-- generator output that the decoder rejects, since satisfying the CDDL does not
+-- make bytes decodable. @zap@ counts the mutations of severity one and above,
+-- which must always be rejected.
+ruleOutcome :: [(DatasetFile, Either Reason ())] -> Outcome
+ruleOutcome results =
+  mempty
+    { generatedTotal = count generated
+    , generatedDecodedReencodedExpected = count decodable
+    , generatedDecodedReencodedActual = count [() | (_, Right ()) <- decodable]
+    , generatedMustBeRejectedExpected = count undecodable
+    , generatedMustBeRejectedActual = count [() | (_, Right ()) <- undecodable]
+    , zapMustBeRejectedExpected = count zaps
+    , zapMustBeRejectedActual = count [() | (_, Right ()) <- zaps]
+    }
+  where
+    count :: [a] -> Sum Int
+    count = Sum . length
+    -- Severity zero is the generator's own output, unmutated, so it counts as
+    -- generated rather than as a mutation even though it lives under @invalid@.
+    decodable = [entry | entry@(file, _) <- results, datasetFileCategory file == Valid]
+    undecodable = [entry | entry@(file, _) <- results, datasetFileCategory file == Zap 0]
+    zaps = [entry | entry@(file, _) <- results, isMutation $ datasetFileCategory file]
+    generated = decodable <> undecodable
+    isMutation (Zap level) = level > 0
+    isMutation Valid = False
 
-  let total = length files
+conformanceReport :: EraSpec -> FilePath -> [(DatasetFile, Either Reason ())] -> ConformanceReport
+conformanceReport era corpus results =
+  ConformanceReport
+    { reportCorpus = corpus
+    , reportProtocolVersion = eraSpecProtocolVersion era
+    , reportTotals = foldMap snd perRule
+    , reportRules = perRule
+    , reportFailures =
+        [ Failure
+            { failureSample = datasetFileSample file
+            , failureRule = ruleCheckName $ datasetFileRule file
+            , failureClass = failureKindLabel kind
+            , failureReason = message
+            }
+        | (file, Left (kind, message)) <- results
+        ]
+    }
+  where
+    perRule =
+      Map.toList . Map.map ruleOutcome $
+        Map.fromListWith
+          (<>)
+          [(ruleCheckName $ datasetFileRule file, [entry]) | entry@(file, _) <- results]
+
+verifyDataset :: EraSpec -> VerificationMode -> FilePath -> IO ()
+verifyDataset era mode datasetDir = do
+  (root, files, absent) <- loadDataset era (modeReadsReferences mode) datasetDir
+  results <- forM files $ \datasetFile -> do
+    outcome <- verifyFile mode datasetFile >>= reportResult datasetFile
+    pure (datasetFile, outcome)
+
+  let outcomes = map snd results
+      total = length files
       expectedValid = length [() | datasetFile <- files, datasetFileExpectation datasetFile == MustDecode]
       expectedInvalid = total - expectedValid
       passed = length [() | Right _ <- outcomes]
@@ -297,58 +393,59 @@ verifyDataset era requestedMode datasetDir = do
   putStrLn $ "  expected invalid: " <> show expectedInvalid
   putStrLn $ "  passed:           " <> show passed
   putStrLn $ "  failed:           " <> show failed
+  -- A rule whose mutations the decoder never rejects is a hole in the suite, so
+  -- name it rather than letting the run look complete.
+  unless (null absent) $
+    putStrLn $ "  absent, no samples: " <> intercalate ", " (sort absent)
+
+  -- Only the mode that checks references has the counts a conformance report
+  -- claims; a deserialize run knows nothing about re-encoding.
+  case mode of
+    DeserializeOnly -> pure ()
+    CheckExpectedOutput -> do
+      let corpus = takeFileName root
+          reportPath = takeDirectory root </> "reports" </> corpus </> "latest.json"
+      writeResult <- try $ writeReport reportPath (conformanceReport era corpus results)
+      case writeResult of
+        Left (err :: IOException) -> die $ "cannot write conformance report: " <> show err
+        Right () -> putStrLn $ "  report:           " <> reportPath
+
   when (failed /= 0) exitFailure
 
-emitExpectedFile :: FilePath -> DatasetFile -> IO (Either String Bool)
-emitExpectedFile outputRoot datasetFile = do
-  checked <- checkDatasetFile reserializeRule datasetFile
-  case checked of
-    Left message -> pure $ Left message
-    Right (_, Nothing) -> pure $ Right False
-    Right (_, Just bytes) -> do
-      let outputPath = outputRoot </> datasetFileRelativePath datasetFile
-      writeResult <-
-        try $ do
-          createDirectoryIfMissing True $ takeDirectory outputPath
-          BS.writeFile outputPath bytes
+-- | Write the normalized reference encoding of one generated @valid@ sample,
+-- returning why it has none when it has none: either the generator emitted
+-- bytes the ledger decoder rejects, or the re-encoding has no reproducible
+-- normal form. Neither stops generation, since the sample itself is still a
+-- legitimate decoder test case.
+emitReference :: RuleCheck -> FilePath -> FilePath -> FilePath -> IO (Maybe String)
+emitReference rule validDir expectedDir fileName = do
+  readResult <- try (BS.readFile $ validDir </> fileName) :: IO (Either IOException BS.ByteString)
+  case fmap (expectedBytes rule) readResult of
+    Left err -> pure $ Just $ "cannot read file: " <> show err
+    Right (Left message) -> pure $ Just message
+    Right (Right (_, bytes)) -> do
+      let outputPath = expectedDir </> fileName
+      writeResult <- try (BS.writeFile outputPath bytes) :: IO (Either IOException ())
       pure $ case writeResult of
-        Left (err :: IOException) -> Left $ "cannot write expected output '" <> outputPath <> "': " <> show err
-        Right () -> Right True
+        Left err -> Just $ "cannot write expected output '" <> outputPath <> "': " <> show err
+        Right () -> Nothing
 
-emitExpectedDataset :: EraSpec -> FilePath -> FilePath -> IO ()
-emitExpectedDataset era datasetDir requestedOutputDir = do
-  (root, files) <- loadDataset era datasetDir
-  outputRoot <- resolveNewExpectedDirectory root requestedOutputDir
-  publication <-
-    try
-      ( publishDirectory outputRoot $ \staging -> do
-          outcomes <- forM files $ \datasetFile ->
-            emitExpectedFile staging datasetFile >>= reportResult datasetFile
-          pure
-            ( length outcomes
-            , length [() | Right True <- outcomes]
-            , length [() | Left _ <- outcomes]
-            )
-      )
-      :: IO (Either IOException (Int, Int, Int))
-  (total, emitted, failed) <-
-    case publication of
-      Left err -> do
-        putStrLn $ "  output directory created: no (" <> outputRoot <> ")"
-        die $ "cannot publish expected outputs: " <> show err
-      Right summary -> pure summary
-  created <- doesDirectoryExist outputRoot
-  putStrLn $ "Checked " <> show total <> " " <> eraSpecName era <> " CBOR files"
-  putStrLn $ "  expected outputs emitted: " <> show emitted
-  putStrLn $ "  failed:                   " <> show failed
-  putStrLn $
-    "  output directory created: "
-      <> (if created then "yes" else "no")
-      <> " ("
-      <> outputRoot
-      <> ")"
-  unless created $ die "expected output publication completed but its directory is missing"
-  when (failed /= 0) exitFailure
+-- | Number of references written for one rule, and the samples that have none.
+emitRuleReferences :: FilePath -> RuleCheck -> IO (Int, Int)
+emitRuleReferences staging rule = do
+  let ruleDir = staging </> ruleCheckName rule
+      validDir = ruleDir </> categoryName Valid
+      expectedDir = ruleDir </> expectedCategoryName
+  createDirectoryIfMissing True expectedDir
+  fileNames <- listDirectoryChecked validDir
+  failures <- forM fileNames $ \fileName -> do
+    outcome <- emitReference rule validDir expectedDir fileName
+    case outcome of
+      Just message ->
+        hPutStrLn stderr $ "FAIL " <> (validDir </> fileName) <> " (" <> message <> ")"
+      Nothing -> pure ()
+    pure outcome
+  pure (length [() | Nothing <- failures], length [() | Just _ <- failures])
 
 sha256Hex :: BS.ByteString -> String
 sha256Hex bytes =
@@ -359,12 +456,12 @@ seedFor topSeed rule category batch =
   case readHex $ take 8 digest of
     [(value, "")] -> fromInteger $ value `mod` 1500000000
     _ -> error "internal error: SHA-256 digest is not hexadecimal"
- where
-  digest = sha256Hex $ BSC.pack $ show topSeed <> "|" <> rule <> "|" <> categoryName category <> "|" <> show batch
+  where
+    digest = sha256Hex $ BSC.pack $ show topSeed <> "|" <> rule <> "|" <> categoryName category <> "|" <> show batch
 
 data BatchResult = BatchResult
-  { batchLines :: ![String]
-  , batchExhausted :: !Bool
+  { batchLines :: ![String],
+    batchExhausted :: !Bool
   }
 
 generateBatch :: EraSpec -> Integer -> RuleCheck -> DatasetCategory -> Int -> Int -> IO BatchResult
@@ -376,18 +473,18 @@ generateBatch era topSeed rule category batch requested = do
           Valid -> []
           Zap level -> ["--zap", show level]
       arguments =
-        [ "--era"
-        , eraSpecName era
-        , "--seed"
-        , show $ seedFor topSeed ruleName category batch
-        , "--count"
-        , show requested
+        [ "--era",
+          eraSpecName era,
+          "--seed",
+          show $ seedFor topSeed ruleName category batch,
+          "--count",
+          show requested
         ]
           <> zapArguments
           <> [ruleName]
   processResult <-
-    try (readProcessWithExitCode "generate-cbor" arguments "")
-      :: IO (Either IOException (ExitCode, String, String))
+    try (readProcessWithExitCode "generate-cbor" arguments "") ::
+      IO (Either IOException (ExitCode, String, String))
   (status, stdoutText, stderrText) <-
     case processResult of
       Left err -> die $ "cannot execute generate-cbor: " <> show err
@@ -406,10 +503,11 @@ generateBatch era topSeed rule category batch requested = do
   case status of
     ExitSuccess -> pure $ BatchResult outputLines False
     ExitFailure code
-      | Zap _ <- category
-      , exhausted -> do
+      | Zap _ <- category,
+        exhausted -> do
           when (length outputLines >= requested) $
-            failGeneration $ ": invalid partial output for a batch of " <> show requested
+            failGeneration $
+              ": invalid partial output for a batch of " <> show requested
           pure $ BatchResult outputLines True
       | otherwise -> failGeneration $ " with exit " <> show code
 
@@ -418,38 +516,85 @@ decodeHex encoded
   | null encoded || odd (length encoded) || any (not . isHexDigit) encoded =
       Left $ "invalid hexadecimal output '" <> encoded <> "'"
   | otherwise = Right $ BS.pack $ decodePairs encoded
- where
-  decodePairs [] = []
-  decodePairs (high : low : rest) =
-    fromIntegral (digitToInt high * 16 + digitToInt low) : decodePairs rest
-  decodePairs _ = error "internal error: odd hexadecimal length"
+  where
+    decodePairs [] = []
+    decodePairs (high : low : rest) =
+      fromIntegral (digitToInt high * 16 + digitToInt low) : decodePairs rest
+    decodePairs _ = error "internal error: odd hexadecimal length"
 
-addGeneratedLine :: FilePath -> String -> DatasetCategory -> (Int, Set.Set String) -> String -> IO (Int, Set.Set String)
-addGeneratedLine categoryDir ruleName category (accepted, seen) encoded = do
+-- | Where one generated sample belongs, decided by the decoder rather than by
+-- which generator run produced it.
+--
+-- A sample the CDDL generator produced but the decoder rejects is not valid, so
+-- it goes under @invalid@ at severity zero. A mutation the decoder still accepts
+-- tests nothing, since the corpus would demand a rejection that is correct not
+-- to happen, so it is dropped: the generator mutates bytes without consulting
+-- the decoder, and rules whose fields are all optional, such as
+-- @protocol_param_update@, often survive a mutation as another legal value.
+data Destination = Keep !DatasetCategory | Drop
+
+destinationOf :: RuleCheck -> DatasetCategory -> BS.ByteString -> Destination
+destinationOf rule category bytes =
+  case category of
+    Valid
+      | rejected -> Keep $ Zap 0
+      | otherwise -> Keep Valid
+    Zap _
+      | rejected -> Keep category
+      | otherwise -> Drop
+  where
+    rejected = isLeft $ deserializeRule rule bytes
+
+-- | Samples written to the category asked for, samples routed to severity zero
+-- because the decoder rejected them, mutations dropped for being decodable, and
+-- the digests seen so far. A dropped mutation still joins the digests, so an
+-- identical one later in the run costs a lookup rather than another decode.
+data Accumulated = Accumulated !Int !Int !Int !(Set.Set String)
+
+addGeneratedLine :: FilePath -> RuleCheck -> DatasetCategory -> Accumulated -> String -> IO Accumulated
+addGeneratedLine ruleDir rule category (Accumulated written rejected dropped seen) encoded = do
+  let ruleName = ruleCheckName rule
   bytes <-
     case decodeHex encoded of
       Left message -> die $ message <> " for " <> ruleName <> "/" <> categoryName category
       Right value -> pure value
   let digest = sha256Hex bytes
+      seenNow = Set.insert digest seen
+      writeTo destination position = do
+        let fileName = printf "%05d-%s.cbor" position (take 16 digest) :: FilePath
+            path = ruleDir </> categoryName destination </> fileName
+        writeResult <- try (BS.writeFile path bytes) :: IO (Either IOException ())
+        case writeResult of
+          Left (err :: IOException) -> die $ "cannot write '" <> path <> "': " <> show err
+          Right () -> pure ()
   if Set.member digest seen
-    then pure (accepted, seen)
-    else do
-      let next = accepted + 1
-          fileName = printf "%05d-%s.cbor" next (take 16 digest)
-          path = categoryDir </> fileName
-      writeResult <- try (BS.writeFile path bytes) :: IO (Either IOException ())
-      case writeResult of
-        Left err -> die $ "cannot write '" <> path <> "': " <> show err
-        Right () -> pure (next, Set.insert digest seen)
+    then pure $ Accumulated written rejected dropped seen
+    else case destinationOf rule category bytes of
+      Drop -> pure $ Accumulated written rejected (dropped + 1) seenNow
+      Keep (Zap 0)
+        | Valid <- category -> do
+            writeTo (Zap 0) (rejected + 1)
+            pure $ Accumulated written (rejected + 1) dropped seenNow
+      Keep destination -> do
+        writeTo destination (written + 1)
+        pure $ Accumulated (written + 1) rejected dropped seenNow
 
+-- | Samples written for one rule and category. The count includes the ones the
+-- @valid@ run routed to severity zero, so a rule still receives the number of
+-- generated samples that was asked for however few of them decode.
 addCases :: FilePath -> EraSpec -> Integer -> RuleCheck -> DatasetCategory -> Int -> IO Int
 addCases staging era topSeed rule category target = do
   let ruleName = ruleCheckName rule
       name = categoryName category
-      categoryDir = staging </> ruleName </> name
+      ruleDir = staging </> ruleName
+      -- The @valid@ run fills severity zero as well, so both directories have to
+      -- exist before it starts.
+      destinations
+        | Valid <- category = [Valid, Zap 0]
+        | otherwise = [category]
       maxAttempts = 3 * target
       batchSize = 128
-      finish accepted attempts batches exhaustions = do
+      finish accepted dropped attempts batches exhaustions = do
         when (accepted /= target) $
           hPutStrLn stderr $
             "generated "
@@ -468,10 +613,22 @@ addCases staging era topSeed rule category target = do
         when (exhaustions > 0) $
           hPutStrLn stderr $
             "retried " <> ruleName <> "/" <> name <> " after " <> show exhaustions <> " generator search exhaustions"
+        -- A rule that drops many mutations has a generator producing weak ones,
+        -- which is worth knowing even when the budget still meets the target.
+        when (dropped > 0) $
+          hPutStrLn stderr $
+            "dropped "
+              <> show dropped
+              <> " "
+              <> ruleName
+              <> "/"
+              <> name
+              <> " mutations the decoder accepts"
         pure accepted
-      loop :: Int -> Int -> Int -> Int -> Set.Set String -> IO Int
-      loop accepted attempts batch exhaustions seen
-        | accepted >= target || attempts >= maxAttempts = finish accepted attempts batch exhaustions
+      loop :: Int -> Int -> Int -> Int -> Int -> Int -> Set.Set String -> IO Int
+      loop written rejected dropped attempts batch exhaustions seen
+        | accepted >= target || attempts >= maxAttempts =
+            finish accepted dropped attempts batch exhaustions
         | otherwise = do
             let requested = min batchSize $ min (target - accepted) (maxAttempts - attempts)
             result <- generateBatch era topSeed rule category batch requested
@@ -487,19 +644,24 @@ addCases staging era topSeed rule category target = do
                   <> show actualLines
                   <> " lines, expected "
                   <> show requested
-            (nextAccepted, nextSeen) <-
+            Accumulated nextWritten nextRejected nextDropped nextSeen <-
               foldM
-                (addGeneratedLine categoryDir ruleName category)
-                (accepted, seen)
+                (addGeneratedLine ruleDir rule category)
+                (Accumulated written rejected dropped seen)
                 (batchLines result)
             loop
-              nextAccepted
+              nextWritten
+              nextRejected
+              nextDropped
               (attempts + attempted)
               (batch + 1)
               (exhaustions + if batchExhausted result then 1 else 0)
               nextSeen
-  createDirectoryIfMissing True categoryDir
-  loop 0 0 0 0 Set.empty
+        where
+          accepted = written + rejected
+  forM_ destinations $ \destination ->
+    createDirectoryIfMissing True $ ruleDir </> categoryName destination
+  loop 0 0 0 0 0 0 Set.empty
 
 generateDataset :: EraSpec -> FilePath -> Integer -> Int -> IO ()
 generateDataset era requestedOutputRoot topSeed count = do
@@ -512,12 +674,17 @@ generateDataset era requestedOutputRoot topSeed count = do
   let corpusName = eraSpecName era <> "-" <> show topSeed <> "-" <> show count
       destination = outputRoot </> corpusName
       rules = eraSpecRules era
-  generated <- publishDirectory destination $ \staging -> do
+  (generated, referenced, unreferenced) <- publishDirectory destination $ \staging -> do
     counts <- forM rules $ \rule ->
-      forM datasetCategories $ \category -> do
+      forM generatedCategories $ \category -> do
         putStrLn $ "Generating " <> ruleCheckName rule <> "/" <> categoryName category
         addCases staging era topSeed rule category count
-    pure $ sum $ concat counts
+    references <- forM rules $ \rule -> do
+      putStrLn $ "Emitting " <> ruleCheckName rule <> "/" <> expectedCategoryName
+      emitRuleReferences staging rule
+    pure (sum $ concat counts, sum $ map fst references, sum $ map snd references)
 
-  let target = length rules * length datasetCategories * count
+  let target = length rules * length generatedCategories * count
   putStrLn $ "Generated " <> show generated <> "/" <> show target <> " samples in " <> destination
+  putStrLn $ "  references emitted:      " <> show referenced
+  putStrLn $ "  valid samples without one: " <> show unreferenced

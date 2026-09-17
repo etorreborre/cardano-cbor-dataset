@@ -5,3 +5,7 @@
 !app/**
 !scripts/
 !scripts/**
+!test/
+!test/**
+!normalization-vectors/
+!normalization-vectors/**

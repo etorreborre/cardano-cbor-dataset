@@ -6,11 +6,13 @@
 
 module LedgerRules (
   RuleCheck,
+  ruleCheckByteExact,
   ruleCheckName,
   deserializeRule,
   reserializeRule,
   EraSpec,
   eraSpecName,
+  eraSpecProtocolVersion,
   eraSpecRules,
   supportedEras,
   supportedEraNames,
@@ -31,6 +33,7 @@ import Cardano.Ledger.Binary (
   decodeFull',
   decodeRecordNamed,
   encodeListLen,
+  getVersion64,
   serialize',
  )
 import Cardano.Ledger.Block (Block)
@@ -99,8 +102,44 @@ decodeAs version transform bytes =
     Left err -> Left $ show err
     Right (value :: a) -> Right $ transform value
 
+-- | Rules whose own bytes are a hash preimage. For those the encoding is part
+-- of the format, since a different encoding is a different hash, so re-encoding
+-- one of these samples must reproduce the original bytes exactly rather than
+-- merely agree with them after normalization.
+--
+-- A rule belongs here only when the bytes of the item this rule encodes are
+-- themselves hashed. Containing something that is hashed is not enough: a
+-- @script@ is a tag beside a payload and a @datum_option@ selects between a
+-- hash and an inline value, so what gets hashed is the payload, encoded by its
+-- own rule, and the selector around it is free to be re-encoded. @cost_models@
+-- is the case worth remembering, because its bytes genuinely do reach a hash,
+-- but as the @language_views@ embedding inside the script integrity hash rather
+-- than as the protocol-parameter map this rule encodes.
+--
+-- The ledger settles it for each type. A type built on @MemoBytes@ keeps the
+-- bytes it decoded and re-emits them verbatim, since @encCBOR@ for a
+-- @MemoBytes@ is @encodePreEncoded@ over the stored bytes, and a hash needs
+-- exactly that. Everything else builds a fresh encoding, so a sample whose
+-- original container form differs from the one the encoder writes cannot be
+-- reproduced by anyone, and listing such a rule would demand the impossible.
+--
+-- @block@, @header_body@ and @transaction@ are the near misses: each wraps
+-- memoized contents in a record it rebuilds on encode, so the parts keep their
+-- bytes while the wrapper does not.
+byteExactRuleNames :: [String]
+byteExactRuleNames =
+  [ "auxiliary_data"
+  , "header"
+  , "native_script"
+  , "plutus_data"
+  , "redeemers"
+  , "transaction_body"
+  , "transaction_witness_set"
+  ]
+
 data RuleCheck = RuleCheck
   { ruleCheckName :: !String
+  , ruleCheckByteExact :: !Bool
   , deserializeRule :: BS.ByteString -> Either String ()
   , reserializeRule :: BS.ByteString -> Either String BS.ByteString
   }
@@ -109,6 +148,7 @@ mkRuleCheck :: forall a. (DecCBOR a, EncCBOR a) => Version -> String -> RuleChec
 mkRuleCheck version name =
   RuleCheck
     { ruleCheckName = name
+    , ruleCheckByteExact = name `elem` byteExactRuleNames
     , deserializeRule = decodeAs @a version $ const ()
     , reserializeRule = decodeAs @a version $ serialize' version
     }
@@ -181,13 +221,20 @@ dijkstraRuleChecks =
 
 data EraSpec = EraSpec
   { eraSpecName :: !String
+  , -- | The protocol version the era's decoders run at, as a conformance
+    -- report spells it. Taken from the ledger rather than written out here, so
+    -- a report cannot claim a version the samples were not decoded against.
+    eraSpecProtocolVersion :: !String
   , eraSpecRules :: ![RuleCheck]
   }
 
+protocolVersionName :: Version -> String
+protocolVersionName version = show (getVersion64 version) <> ".0"
+
 supportedEras :: [EraSpec]
 supportedEras =
-  [ EraSpec "conway" conwayRuleChecks
-  , EraSpec "dijkstra" dijkstraRuleChecks
+  [ EraSpec "conway" (protocolVersionName $ eraProtVerHigh @ConwayEra) conwayRuleChecks
+  , EraSpec "dijkstra" (protocolVersionName $ eraProtVerHigh @DijkstraEra) dijkstraRuleChecks
   ]
 
 supportedEraNames :: [String]
