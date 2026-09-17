@@ -37,3 +37,21 @@ executable cbor
     temporary,
     text,
     unix
+
+-- Checks the committed normalization vectors. It reaches into `app` for
+-- `Normalize`, which depends only on `cborg`, so this builds without the ledger
+-- packages the executable needs.
+test-suite normalization-vectors
+  type:             exitcode-stdio-1.0
+  main-is:          CheckVectors.hs
+  hs-source-dirs:   app test
+  other-modules:    Normalize
+  default-language: Haskell2010
+  ghc-options:      -Wall -Wcompat
+  build-depends:
+    base,
+    bytestring,
+    cborg,
+    directory,
+    filepath,
+    text

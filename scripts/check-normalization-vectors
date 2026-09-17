@@ -1,0 +1,21 @@
+#!/bin/sh
+# Fail if the reference implementation disagrees with any committed vector.
+#
+# The check itself is a test suite that runs inside the image, in a stage the
+# runtime image does not depend on, so a stale vector fails here without
+# blocking a build of the tool. This script only drives Docker.
+#
+# Run from anywhere; the repository root is derived from the script's location.
+set -eu
+
+image=${CBOR_IMAGE:-cbor-vectors}
+root=$(cd "$(dirname "$0")/.." && pwd)
+
+# Plain progress because the per-vector ok/FAIL lines are the point, and the
+# default output collapses them.
+exec docker build \
+  --platform=linux/amd64 \
+  --target vector-check \
+  --progress=plain \
+  -t "$image" \
+  "$root"
